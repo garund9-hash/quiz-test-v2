@@ -1,11 +1,29 @@
 /**
  * Quiz Expiration and TTL Management
- * Handles automatic quiz expiration and lifecycle tracking
+ * Handles automatic quiz expiration and lifecycle tracking with security controls
  */
 
-import { getQuizRepository } from '@/lib/repositories/quiz-repository';
-import { getScoreRepository } from '@/lib/repositories/score-repository';
+import { z } from 'zod';
+import {
+  collection,
+  query,
+  where,
+  getDocs,
+  writeBatch,
+  Timestamp,
+  limit as queryLimit,
+  serverTimestamp
+} from 'firebase/firestore';
+import { db } from './firebase';
+import { getQuizRepository } from './repositories/quiz-repository';
+import { getScoreRepository } from './repositories/score-repository';
 import { invalidateQuizCache, invalidateLeaderboardCache } from './cache';
+import { createRateLimiter, RateLimitExceededError } from './rate-limiter';
+import {
+  logSecurityEvent,
+  logUnauthorizedAccess,
+  logRateLimitExceeded
+} from './security-logger';
 
 // ============================================================================
 // Time Constants (milliseconds)
@@ -16,7 +34,17 @@ const ONE_HOUR = 60 * ONE_MINUTE;
 const ONE_DAY = 24 * ONE_HOUR;
 
 // ============================================================================
-// Configuration
+// Security Configuration
+// ============================================================================
+
+/** Grace period for expiration checks (prevents issues with clock skew) */
+export const EXPIRATION_GRACE_PERIOD_MS = 5 * ONE_MINUTE;
+
+/** Maximum cleanup batch size to prevent timeout */
+const CLEANUP_BATCH_SIZE = 100;
+
+// ============================================================================
+// TTL Configuration
 // ============================================================================
 
 export const QUIZ_TTL_CONFIG = {
@@ -34,6 +62,30 @@ export interface QuizTTLConfig {
   ttl: number;
   autoExpire: boolean;
 }
+
+// ============================================================================
+// Input Validation Schemas
+// ============================================================================
+
+const expireQuizSchema = z.object({
+  quizId: z
+    .string()
+    .min(1, 'Quiz ID is required')
+    .max(100, 'Quiz ID is too long'),
+  pin: z
+    .string()
+    .length(4, 'PIN must be exactly 4 digits')
+    .regex(/^\d{4}$/, 'PIN must contain only digits'),
+  userId: z
+    .string()
+    .min(1, 'User ID is required')
+    .max(100, 'User ID is too long')
+});
+
+const cleanupQuizSchema = z.object({
+  dryRun: z.boolean().optional().default(false),
+  batchSize: z.number().int().min(1).max(500).optional().default(CLEANUP_BATCH_SIZE)
+});
 
 // ============================================================================
 // Expiration Calculation
@@ -55,10 +107,25 @@ export function calculateExpiryDate(ttl?: number): Date {
 
 /**
  * Check if a quiz is expired
+ * @param expiresAt - Expiration timestamp
+ * @param options - Optional configuration
  */
-export function isQuizExpired(expiresAt: Date | null): boolean {
+export function isQuizExpired(
+  expiresAt: Date | null,
+  options: { strict?: boolean } = {}
+): boolean {
   if (!expiresAt) return false;
-  return new Date() > expiresAt;
+
+  const now = Date.now();
+  const expiryTime = expiresAt.getTime();
+
+  // Apply grace period for non-strict checks (better UX)
+  if (!options.strict) {
+    return now > expiryTime + EXPIRATION_GRACE_PERIOD_MS;
+  }
+
+  // Strict check for security-critical operations
+  return now > expiryTime;
 }
 
 // ============================================================================
@@ -92,8 +159,8 @@ export function getTimeUntilExpiry(expiresAt: Date | null): TimeRemaining {
   return {
     expired: differenceMs <= 0,
     milliseconds: Math.max(0, differenceMs),
-    hours: Math.floor(Math.max(0, differenceMs) / (ONE_HOUR)),
-    days: Math.floor(Math.max(0, differenceMs) / (ONE_DAY))
+    hours: Math.floor(Math.max(0, differenceMs) / ONE_HOUR),
+    days: Math.floor(Math.max(0, differenceMs) / ONE_DAY)
   };
 }
 
@@ -114,65 +181,219 @@ export function formatExpiryTime(expiresAt: Date | null): string {
 }
 
 // ============================================================================
-// Quiz Expiration Operations
+// Quiz Expiration Operations (With Security Controls)
 // ============================================================================
 
+export interface ExpireQuizOptions {
+  userId: string;
+  clientIp?: string;
+  reason?: 'manual' | 'auto' | 'admin';
+}
+
+export interface ExpireQuizResult {
+  success: boolean;
+  error?: string;
+  wasAlreadyExpired?: boolean;
+}
+
 /**
- * Expire a quiz and clean up associated data
+ * Expire a quiz with full security controls
+ * - Input validation
+ * - Rate limiting
+ * - Authorization checks
+ * - Secure audit logging
  */
 export async function expireQuiz(
   quizId: string,
-  pin: string
-): Promise<{ success: boolean; error?: string }> {
-  try {
-    const quizRepository = getQuizRepository();
+  pin: string,
+  options: ExpireQuizOptions
+): Promise<ExpireQuizResult> {
+  const { userId, clientIp = 'unknown', reason = 'manual' } = options;
 
-    // Update quiz status to expired
+  try {
+    // Step 1: Validate inputs
+    const validation = expireQuizSchema.safeParse({ quizId, pin, userId });
+    if (!validation.success) {
+      await logSecurityEvent('invalid_request', {
+        action: 'expire_quiz',
+        userId,
+        errors: validation.error.issues.map(e => e.message)
+      });
+      return { success: false, error: 'Invalid request parameters' };
+    }
+
+    // Step 2: Rate limiting (strict - only 3 per hour per user)
+    const rateLimiter = createRateLimiter('quizGeneration');
+    const rateLimitId = `expire:${userId}`;
+
+    try {
+      rateLimiter.enforceLimit(rateLimitId);
+    } catch (error) {
+      if (error instanceof RateLimitExceededError) {
+        await logRateLimitExceeded('expire_quiz', userId, 3);
+        return { success: false, error: 'Too many requests. Please try again later.' };
+      }
+      throw error;
+    }
+
+    // Step 3: Authorization check - verify quiz exists and get current status
+    const quizRepository = getQuizRepository();
+    const quizResult = await quizRepository.findByPin(pin);
+
+    if (!quizResult.success || !quizResult.data) {
+      await logUnauthorizedAccess('quiz', userId, 'quiz_not_found');
+      return { success: false, error: 'Quiz not found' };
+    }
+
+    const quiz = quizResult.data;
+
+    // Step 4: Check if already expired (not an error, just informational)
+    const alreadyExpired = isQuizExpired(quiz.expiresAt, { strict: true });
+
+    // Step 5: Authorization - In a real app, verify user owns this quiz
+    // For now, we'll check if the user has the correct PIN (basic auth)
+    const isAuthorized = await verifyQuizAccess(quizId, userId, pin);
+
+    if (!isAuthorized) {
+      await logUnauthorizedAccess('quiz', userId, 'invalid_pin');
+      return { 
+        success: false, 
+        error: 'Unauthorized: Invalid credentials for this quiz' 
+      };
+    }
+
+    // Step 6: Perform expiration
     const updateResult = await quizRepository.updateStatus(quizId, 'expired');
     if (!updateResult.success) {
       return { success: false, error: updateResult.error };
     }
 
-    // Invalidate caches
+    // Step 7: Invalidate caches
     invalidateQuizCache(pin);
     invalidateLeaderboardCache(pin);
 
-    console.log(`[TTL Manager] Quiz ${quizId} (${pin}) expired successfully`);
-    return { success: true };
+    // Step 8: Audit logging (without sensitive data)
+    await logSecurityEvent('quiz_expired', {
+      quizId,
+      userId,
+      reason,
+      wasAlreadyExpired: alreadyExpired,
+      topic: quiz.topic.substring(0, 50) // Truncate for privacy
+    });
+
+    return {
+      success: true,
+      wasAlreadyExpired: alreadyExpired
+    };
+
   } catch (error: unknown) {
     const errorMessage = error instanceof Error ? error.message : 'Unknown error';
-    console.error('[TTL Manager] Error expiring quiz:', errorMessage);
-    return { success: false, error: errorMessage };
+
+    await logSecurityEvent('cleanup_failed', {
+      action: 'expire_quiz',
+      quizId,
+      userId,
+      error: errorMessage
+    });
+
+    return { success: false, error: 'Failed to expire quiz' };
   }
+}
+
+// ============================================================================
+// Cleanup Operations
+// ============================================================================
+
+export interface CleanupOptions {
+  dryRun?: boolean;
+  batchSize?: number;
+}
+
+export interface CleanupResult {
+  success: boolean;
+  expiredCount: number;
+  errors: string[];
 }
 
 /**
  * Clean up all expired quizzes
- * Should be called periodically (e.g., via cron job or Cloud Function)
+ * Implements actual cleanup with batch processing
  */
-export async function cleanupExpiredQuizzes(): Promise<{
-  success: boolean;
-  expiredCount: number;
-  errors: string[];
-}> {
-  try {
-    // Note: This would ideally query for expired quizzes directly
-    // For production, use Firebase Cloud Functions with scheduled triggers
-    console.log('[TTL Manager] Cleanup job executed');
+export async function cleanupExpiredQuizzes(
+  options: CleanupOptions = {}
+): Promise<CleanupResult> {
+  const { dryRun = false, batchSize = CLEANUP_BATCH_SIZE } = options;
 
-    return {
-      success: true,
-      expiredCount: 0,
-      errors: []
-    };
+  const errors: string[] = [];
+  let expiredCount = 0;
+
+  try {
+    // Validate options
+    const validation = cleanupQuizSchema.safeParse(options);
+    if (!validation.success) {
+      errors.push('Invalid cleanup options');
+      return { success: false, expiredCount: 0, errors };
+    }
+
+    const quizzesRef = collection(db, 'quizzes');
+    const now = Timestamp.fromDate(new Date());
+
+    // Query for expired quizzes that are still marked as active
+    const q = query(
+      quizzesRef,
+      where('expiresAt', '<=', now),
+      where('status', '==', 'active'),
+      queryLimit(batchSize)
+    );
+
+    const snapshot = await getDocs(q);
+
+    if (dryRun) {
+      await logSecurityEvent('cleanup_dry_run', {
+        count: snapshot.size,
+        timestamp: Date.now()
+      });
+      return { success: true, expiredCount: snapshot.size, errors: [] };
+    }
+
+    if (snapshot.empty) {
+      return { success: true, expiredCount: 0, errors: [] };
+    }
+
+    // Process in batch
+    const batch = writeBatch(db);
+    let batchCount = 0;
+
+    for (const doc of snapshot.docs) {
+      batch.update(doc.ref, {
+        status: 'expired',
+        expiredAt: serverTimestamp()
+      });
+      batchCount++;
+    }
+
+    await batch.commit();
+    expiredCount = batchCount;
+
+    // Log successful cleanup
+    await logSecurityEvent('cleanup_completed', {
+      expiredCount,
+      batchSize,
+      timestamp: Date.now()
+    });
+
+    return { success: true, expiredCount, errors };
+
   } catch (error: unknown) {
     const errorMessage = error instanceof Error ? error.message : 'Unknown error';
-    console.error('[TTL Manager] Cleanup failed:', errorMessage);
-    return {
-      success: false,
-      expiredCount: 0,
-      errors: [errorMessage]
-    };
+
+    await logSecurityEvent('cleanup_failed', {
+      error: errorMessage,
+      timestamp: Date.now()
+    });
+
+    errors.push(errorMessage);
+    return { success: false, expiredCount: 0, errors };
   }
 }
 
@@ -213,6 +434,32 @@ export function getQuizLifecycleInfo(
 // ============================================================================
 // Private Helper Functions
 // ============================================================================
+
+/**
+ * Verify user has access to the quiz
+ * In production, implement proper ownership verification
+ */
+async function verifyQuizAccess(
+  quizId: string,
+  userId: string,
+  pin: string
+): Promise<boolean> {
+  // TODO: Implement proper ownership verification based on your auth system
+  // For now, we verify the PIN matches (basic check)
+  // In production, this should check:
+  // 1. Is user the quiz creator? OR
+  // 2. Does user have explicit permission?
+
+  const quizRepository = getQuizRepository();
+  const result = await quizRepository.findByPin(pin);
+
+  if (!result.success || !result.data) {
+    return false;
+  }
+
+  // Basic PIN verification (replace with proper auth check)
+  return result.data.id === quizId;
+}
 
 function clamp(value: number, min: number, max: number): number {
   return Math.max(min, Math.min(value, max));
