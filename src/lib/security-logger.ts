@@ -31,7 +31,8 @@ export type SecurityEventType =
   | 'auth_failure'
   | 'data_access'
   | 'permission_denied'
-  | 'suspicious_activity';
+  | 'suspicious_activity'
+  | 'slow_operation';
 
 export interface SecurityLogData {
   eventType: SecurityEventType;
