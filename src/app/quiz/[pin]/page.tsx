@@ -60,7 +60,7 @@ export default function QuizPage({ params }: { params: Promise<{ pin: string }> 
     setSubmitting(true);
     const res = await submitQuizAnswers(pin, nickname, answers);
     if (res.success) {
-      setResult(res);
+      setResult(res.data);
     } else {
       alert(res.error || 'Failed to submit quiz');
     }
