@@ -1,194 +1,176 @@
 /**
  * Circuit Breaker Pattern Implementation
- * Prevents cascade failures and provides graceful degradation
+ * Prevents cascade failures and provides graceful degradation for external services
  */
+
+// ============================================================================
+// Time Constants (milliseconds)
+// ============================================================================
+
+const ONE_SECOND = 1000;
+const ONE_MINUTE = 60 * ONE_SECOND;
+
+// ============================================================================
+// Type Definitions
+// ============================================================================
 
 export type CircuitState = 'CLOSED' | 'OPEN' | 'HALF_OPEN';
 
-export interface CircuitBreakerConfig {
-  failureThreshold: number;   // Number of failures before opening circuit
-  successThreshold: number;   // Number of successes in half-open to close
-  timeout: number;            // Time in ms before attempting reset (OPEN -> HALF_OPEN)
-  monitoringPeriod: number;   // Time window for counting failures
+export interface CircuitBreakerConfiguration {
+  /** Number of failures before opening circuit */
+  failureThreshold: number;
+  /** Number of successes in HALF_OPEN to close circuit */
+  successThreshold: number;
+  /** Milliseconds before transitioning from OPEN to HALF_OPEN */
+  openTimeout: number;
 }
 
-const defaultConfig: CircuitBreakerConfig = {
+interface CircuitStatistics {
+  consecutiveFailures: number;
+  consecutiveSuccesses: number;
+  lastFailureTimestamp: number | null;
+  lastStateChangeTimestamp: number;
+  currentState: CircuitState;
+}
+
+// ============================================================================
+// Default Configuration
+// ============================================================================
+
+const DEFAULT_CONFIG: CircuitBreakerConfiguration = {
   failureThreshold: 5,
   successThreshold: 2,
-  timeout: 30000,              // 30 seconds
-  monitoringPeriod: 60000      // 1 minute
+  openTimeout: 30 * ONE_SECOND
 };
 
-export class CircuitBreakerError extends Error {
+// ============================================================================
+// Error Classes
+// ============================================================================
+
+export class CircuitOpenError extends Error {
+  public readonly circuitState: CircuitState;
+  public readonly retryAfterMilliseconds: number;
+  
   constructor(
-    message: string,
-    public readonly state: CircuitState,
-    public readonly retryAfter?: number
+    serviceName: string,
+    state: CircuitState,
+    retryAfterMilliseconds: number
   ) {
-    super(message);
-    this.name = 'CircuitBreakerError';
+    super(`Circuit breaker is OPEN for ${serviceName}. Retry after ${retryAfterMilliseconds}ms.`);
+    this.name = 'CircuitOpenError';
+    this.circuitState = state;
+    this.retryAfterMilliseconds = retryAfterMilliseconds;
   }
 }
 
-interface CircuitStats {
-  failures: number;
-  successes: number;
-  lastFailureTime: number | null;
-  lastStateChange: number;
-  state: CircuitState;
-}
+// ============================================================================
+// Circuit Breaker Class
+// ============================================================================
 
 /**
- * Circuit Breaker for external service calls
+ * Implements the circuit breaker pattern for fault tolerance
  */
 export class CircuitBreaker {
-  private config: CircuitBreakerConfig;
-  private stats: CircuitStats;
-  private readonly name: string;
+  private readonly serviceName: string;
+  private readonly config: CircuitBreakerConfiguration;
+  private stats: CircuitStatistics;
 
   constructor(
-    name: string,
-    config: Partial<CircuitBreakerConfig> = {}
+    serviceName: string,
+    config: Partial<CircuitBreakerConfiguration> = {}
   ) {
-    this.name = name;
-    this.config = { ...defaultConfig, ...config };
-    this.stats = this.resetStats();
-  }
-
-  private resetStats(): CircuitStats {
-    return {
-      failures: 0,
-      successes: 0,
-      lastFailureTime: null,
-      lastStateChange: Date.now(),
-      state: 'CLOSED'
-    };
+    this.serviceName = serviceName;
+    this.config = { ...DEFAULT_CONFIG, ...config };
+    this.stats = this.initializeStats();
   }
 
   /**
    * Execute a function with circuit breaker protection
+   * @param operation - Async function to execute
+   * @throws CircuitOpenError if circuit is open
    */
-  async execute<T>(fn: () => Promise<T>): Promise<T> {
-    // Check if we should allow the request
-    if (!this.canExecute()) {
-      const retryAfter = this.getRetryAfter();
-      throw new CircuitBreakerError(
-        `Circuit breaker is OPEN for ${this.name}. Retry after ${retryAfter}ms.`,
-        this.stats.state,
-        retryAfter
-      );
+  async execute<T>(operation: () => Promise<T>): Promise<T> {
+    if (!this.isExecutionAllowed()) {
+      const retryAfter = this.getRetryAfterMilliseconds();
+      throw new CircuitOpenError(this.serviceName, this.stats.currentState, retryAfter);
     }
 
     try {
-      const result = await fn();
-      this.onSuccess();
+      const result = await operation();
+      this.recordSuccess();
       return result;
     } catch (error) {
-      this.onFailure();
+      this.recordFailure();
       throw error;
     }
   }
 
   /**
-   * Check if the circuit allows execution
+   * Check if circuit allows execution
    */
-  private canExecute(): boolean {
-    const now = Date.now();
+  isExecutionAllowed(): boolean {
+    const currentTimestamp = Date.now();
 
-    switch (this.stats.state) {
+    switch (this.stats.currentState) {
       case 'CLOSED':
         return true;
-
+        
       case 'OPEN':
-        // Check if timeout has passed to transition to HALF_OPEN
-        if (now - this.stats.lastStateChange >= this.config.timeout) {
+        if (this.shouldTransitionToHalfOpen(currentTimestamp)) {
           this.transitionTo('HALF_OPEN');
           return true;
         }
         return false;
-
+        
       case 'HALF_OPEN':
         return true;
-
+        
       default:
         return true;
     }
   }
 
   /**
-   * Handle successful execution
+   * Record a successful operation
    */
-  private onSuccess(): void {
-    this.stats.successes++;
-    this.stats.failures = 0; // Reset failure count on success
+  recordSuccess(): void {
+    this.stats.consecutiveSuccesses++;
+    this.stats.consecutiveFailures = 0;
 
-    if (this.stats.state === 'HALF_OPEN') {
-      if (this.stats.successes >= this.config.successThreshold) {
-        this.transitionTo('CLOSED');
-      }
+    if (this.stats.currentState === 'HALF_OPEN' && 
+        this.stats.consecutiveSuccesses >= this.config.successThreshold) {
+      this.transitionTo('CLOSED');
     }
   }
 
   /**
-   * Handle failed execution
+   * Record a failed operation
    */
-  private onFailure(): void {
-    this.stats.failures++;
-    this.stats.lastFailureTime = Date.now();
+  recordFailure(): void {
+    this.stats.consecutiveFailures++;
+    this.stats.lastFailureTimestamp = Date.now();
 
-    if (this.stats.state === 'HALF_OPEN') {
-      // Any failure in half-open immediately opens the circuit
+    if (this.stats.currentState === 'HALF_OPEN') {
       this.transitionTo('OPEN');
     } else if (
-      this.stats.state === 'CLOSED' &&
-      this.stats.failures >= this.config.failureThreshold
+      this.stats.currentState === 'CLOSED' &&
+      this.stats.consecutiveFailures >= this.config.failureThreshold
     ) {
       this.transitionTo('OPEN');
     }
   }
 
   /**
-   * Transition to a new state
-   */
-  private transitionTo(newState: CircuitState): void {
-    if (this.stats.state === newState) return;
-
-    const oldState = this.stats.state;
-    this.stats.state = newState;
-    this.stats.lastStateChange = Date.now();
-
-    // Reset counters on state transition
-    if (newState === 'CLOSED') {
-      this.stats.successes = 0;
-      this.stats.failures = 0;
-    } else if (newState === 'HALF_OPEN') {
-      this.stats.successes = 0;
-    }
-
-    console.log(`[CircuitBreaker:${this.name}] ${oldState} -> ${newState}`);
-  }
-
-  /**
-   * Get time until retry is allowed
-   */
-  private getRetryAfter(): number {
-    if (this.stats.state !== 'OPEN') return 0;
-    
-    const elapsed = Date.now() - this.stats.lastStateChange;
-    return Math.max(0, this.config.timeout - elapsed);
-  }
-
-  /**
    * Get current circuit state
    */
   getState(): CircuitState {
-    return this.stats.state;
+    return this.stats.currentState;
   }
 
   /**
    * Get circuit statistics
    */
-  getStats(): CircuitStats {
+  getStatistics(): CircuitStatistics {
     return { ...this.stats };
   }
 
@@ -196,58 +178,106 @@ export class CircuitBreaker {
    * Manually reset the circuit breaker
    */
   reset(): void {
-    this.stats = this.resetStats();
+    this.stats = this.initializeStats();
   }
 
   /**
-   * Force open the circuit (for manual intervention)
+   * Force circuit to open state
    */
   forceOpen(): void {
     this.transitionTo('OPEN');
   }
 
   /**
-   * Force close the circuit (for manual intervention)
+   * Force circuit to closed state
    */
   forceClose(): void {
     this.transitionTo('CLOSED');
   }
+
+  // ============================================================================
+  // Private Helper Methods
+  // ============================================================================
+
+  private initializeStats(): CircuitStatistics {
+    return {
+      consecutiveFailures: 0,
+      consecutiveSuccesses: 0,
+      lastFailureTimestamp: null,
+      lastStateChangeTimestamp: Date.now(),
+      currentState: 'CLOSED'
+    };
+  }
+
+  private shouldTransitionToHalfOpen(currentTimestamp: number): boolean {
+    const elapsed = currentTimestamp - this.stats.lastStateChangeTimestamp;
+    return elapsed >= this.config.openTimeout;
+  }
+
+  private getRetryAfterMilliseconds(): number {
+    if (this.stats.currentState !== 'OPEN') return 0;
+    
+    const elapsed = Date.now() - this.stats.lastStateChangeTimestamp;
+    return Math.max(0, this.config.openTimeout - elapsed);
+  }
+
+  private transitionTo(newState: CircuitState): void {
+    if (this.stats.currentState === newState) return;
+
+    const previousState = this.stats.currentState;
+    this.stats.currentState = newState;
+    this.stats.lastStateChangeTimestamp = Date.now();
+    this.resetCounters(newState);
+
+    console.log(`[CircuitBreaker:${this.serviceName}] ${previousState} → ${newState}`);
+  }
+
+  private resetCounters(newState: CircuitState): void {
+    if (newState === 'CLOSED') {
+      this.stats.consecutiveFailures = 0;
+      this.stats.consecutiveSuccesses = 0;
+    } else if (newState === 'HALF_OPEN') {
+      this.stats.consecutiveSuccesses = 0;
+    }
+  }
 }
 
-/**
- * Pre-configured circuit breakers for different services
- */
+// ============================================================================
+// Pre-configured Circuit Breakers
+// ============================================================================
 
-// Gemini API circuit breaker
+/** Circuit breaker for Gemini API calls */
 export const geminiCircuitBreaker = new CircuitBreaker('Gemini API', {
   failureThreshold: 3,
   successThreshold: 2,
-  timeout: 60000,           // 1 minute timeout
-  monitoringPeriod: 120000  // 2 minute monitoring window
+  openTimeout: ONE_MINUTE
 });
 
-// Firebase circuit breaker
+/** Circuit breaker for Firebase operations */
 export const firebaseCircuitBreaker = new CircuitBreaker('Firebase', {
   failureThreshold: 5,
   successThreshold: 2,
-  timeout: 30000,           // 30 seconds timeout
-  monitoringPeriod: 60000   // 1 minute monitoring window
+  openTimeout: 30 * ONE_SECOND
 });
 
+// ============================================================================
+// Helper Functions
+// ============================================================================
+
 /**
- * Execute with fallback if circuit is open
+ * Execute with fallback when circuit is open
  */
 export async function executeWithFallback<T>(
-  circuitBreaker: CircuitBreaker,
-  primaryFn: () => Promise<T>,
-  fallbackFn: () => Promise<T>
+  breaker: CircuitBreaker,
+  primaryOperation: () => Promise<T>,
+  fallbackOperation: () => Promise<T>
 ): Promise<T> {
   try {
-    return await circuitBreaker.execute(primaryFn);
+    return await breaker.execute(primaryOperation);
   } catch (error) {
-    if (error instanceof CircuitBreakerError) {
-      console.warn(`[CircuitBreaker:${circuitBreaker}] Circuit open, using fallback`);
-      return await fallbackFn();
+    if (error instanceof CircuitOpenError) {
+      console.warn(`[CircuitBreaker:${breaker}] Circuit open, using fallback`);
+      return await fallbackOperation();
     }
     throw error;
   }

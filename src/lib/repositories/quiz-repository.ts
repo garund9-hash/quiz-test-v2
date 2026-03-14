@@ -11,139 +11,170 @@ import {
   serverTimestamp,
   Timestamp 
 } from 'firebase/firestore';
-import { Quiz, QuizRepository, Result } from '@/lib/types';
+import { Quiz, QuizRepository, OperationResult } from '@/lib/types';
+
+// ============================================================================
+// Firestore Quiz Repository Implementation
+// ============================================================================
 
 /**
  * Firestore implementation of QuizRepository
  * Handles all quiz-related database operations
  */
 export class FirestoreQuizRepository implements QuizRepository {
-  private readonly collectionName = 'quizzes';
+  private static readonly COLLECTION_NAME = 'quizzes';
 
-  private getCollection() {
-    return collection(db, this.collectionName);
-  }
+  // ============================================================================
+  // Public Methods
+  // ============================================================================
 
-  private toFirestoreDate(date: Date | null) {
-    return date ? Timestamp.fromDate(date) : null;
-  }
-
-  private fromFirestoreDate(timestamp: Timestamp | null | undefined): Date | null {
-    if (!timestamp) return null;
-    return timestamp.toDate();
-  }
-
-  private mapToQuiz(docData: any, id: string): Quiz {
-    return {
-      id,
-      pin: docData.pin,
-      topic: docData.topic,
-      questions: docData.questions || [],
-      clientQuestions: docData.clientQuestions || [],
-      createdAt: this.fromFirestoreDate(docData.createdAt),
-      expiresAt: this.fromFirestoreDate(docData.expiresAt),
-      status: docData.status || 'active'
-    };
-  }
-
-  async createQuiz(quiz: Omit<Quiz, 'id'>): Promise<Result<string>> {
-    try {
-      const docRef = await addDoc(this.getCollection(), {
+  async createQuiz(quiz: Omit<Quiz, 'id'>): Promise<OperationResult<string>> {
+    return this.executeWithErrorHandling(async () => {
+      const documentReference = await addDoc(this.getCollection(), {
         pin: quiz.pin,
         topic: quiz.topic,
         questions: quiz.questions,
         clientQuestions: quiz.clientQuestions,
         createdAt: serverTimestamp(),
-        expiresAt: this.toFirestoreDate(quiz.expiresAt),
+        expiresAt: this.toFirestoreTimestamp(quiz.expiresAt),
         status: quiz.status
       });
 
-      return { success: true, data: docRef.id };
-    } catch (error: any) {
-      console.error('Error creating quiz:', error);
-      return { 
-        success: false, 
-        error: error.message || 'Failed to create quiz' 
-      };
-    }
+      return { success: true, data: documentReference.id };
+    }, 'create quiz');
   }
 
-  async findByPin(pin: string): Promise<Result<Quiz>> {
-    try {
-      const q = query(this.getCollection(), where('pin', '==', pin));
-      const snapshot = await getDocs(q);
-
-      if (snapshot.empty) {
+  async findByPin(pin: string): Promise<OperationResult<Quiz>> {
+    return this.executeWithErrorHandling(async () => {
+      const quiz = await this.fetchQuizByPin(pin);
+      
+      if (!quiz) {
         return { success: false, error: 'Quiz not found' };
       }
 
-      const doc = snapshot.docs[0];
-      return { success: true, data: this.mapToQuiz(doc.data(), doc.id) };
-    } catch (error: any) {
-      console.error('Error finding quiz by PIN:', error);
-      return { 
-        success: false, 
-        error: error.message || 'Failed to find quiz' 
-      };
-    }
+      return { success: true, data: quiz };
+    }, 'find quiz by PIN');
   }
 
-  async findActiveByPin(pin: string): Promise<Result<Quiz>> {
-    try {
-      const q = query(
-        this.getCollection(),
-        where('pin', '==', pin),
-        where('status', '==', 'active')
-      );
-      const snapshot = await getDocs(q);
-
-      if (snapshot.empty) {
+  async findActiveByPin(pin: string): Promise<OperationResult<Quiz>> {
+    return this.executeWithErrorHandling(async () => {
+      const quiz = await this.fetchActiveQuizByPin(pin);
+      
+      if (!quiz) {
         return { success: false, error: 'Quiz not found or not active' };
       }
 
-      const doc = snapshot.docs[0];
-      return { success: true, data: this.mapToQuiz(doc.data(), doc.id) };
-    } catch (error: any) {
-      console.error('Error finding active quiz:', error);
-      return { 
-        success: false, 
-        error: error.message || 'Failed to find quiz' 
-      };
+      return { success: true, data: quiz };
+    }, 'find active quiz');
+  }
+
+  async updateStatus(id: string, status: Quiz['status']): Promise<OperationResult<void>> {
+    return this.executeWithErrorHandling(async () => {
+      const documentReference = doc(db, FirestoreQuizRepository.COLLECTION_NAME, id);
+      await updateDoc(documentReference, { status });
+
+      return { success: true };
+    }, 'update quiz status');
+  }
+
+  async deleteQuiz(id: string): Promise<OperationResult<void>> {
+    return this.executeWithErrorHandling(async () => {
+      const documentReference = doc(db, FirestoreQuizRepository.COLLECTION_NAME, id);
+      await deleteDoc(documentReference);
+
+      return { success: true };
+    }, 'delete quiz');
+  }
+
+  // ============================================================================
+  // Private Methods - Data Access
+  // ============================================================================
+
+  private getCollection() {
+    return collection(db, FirestoreQuizRepository.COLLECTION_NAME);
+  }
+
+  private async fetchQuizByPin(pin: string): Promise<Quiz | null> {
+    const dbQuery = query(this.getCollection(), where('pin', '==', pin));
+    const snapshot = await getDocs(dbQuery);
+
+    if (snapshot.empty) return null;
+
+    const document = snapshot.docs[0];
+    return this.mapToQuiz(document.data(), document.id);
+  }
+
+  private async fetchActiveQuizByPin(pin: string): Promise<Quiz | null> {
+    const dbQuery = query(
+      this.getCollection(),
+      where('pin', '==', pin),
+      where('status', '==', 'active')
+    );
+    const snapshot = await getDocs(dbQuery);
+
+    if (snapshot.empty) return null;
+
+    const document = snapshot.docs[0];
+    return this.mapToQuiz(document.data(), document.id);
+  }
+
+  // ============================================================================
+  // Private Methods - Data Mapping
+  // ============================================================================
+
+  private mapToQuiz(documentData: Record<string, unknown>, id: string): Quiz {
+    return {
+      id,
+      pin: documentData.pin as string,
+      topic: documentData.topic as string,
+      questions: (documentData.questions as Quiz['questions']) || [],
+      clientQuestions: (documentData.clientQuestions as Quiz['clientQuestions']) || [],
+      createdAt: this.fromFirestoreTimestamp(documentData.createdAt as Timestamp | null),
+      expiresAt: this.fromFirestoreTimestamp(documentData.expiresAt as Timestamp | null),
+      status: (documentData.status as Quiz['status']) || 'active'
+    };
+  }
+
+  private toFirestoreTimestamp(date: Date | null): Timestamp | null {
+    return date ? Timestamp.fromDate(date) : null;
+  }
+
+  private fromFirestoreTimestamp(
+    timestamp: Timestamp | null | undefined
+  ): Date | null {
+    if (!timestamp) return null;
+    return timestamp.toDate();
+  }
+
+  // ============================================================================
+  // Private Methods - Error Handling
+  // ============================================================================
+
+  private async executeWithErrorHandling<T>(
+    operation: () => Promise<OperationResult<T>>,
+    operationName: string
+  ): Promise<OperationResult<T>> {
+    try {
+      return await operation();
+    } catch (error: unknown) {
+      const errorMessage = this.extractErrorMessage(error);
+      console.error(`Error ${operationName}:`, errorMessage);
+      return { success: false, error: errorMessage };
     }
   }
 
-  async updateStatus(id: string, status: Quiz['status']): Promise<Result<void>> {
-    try {
-      const docRef = doc(db, this.collectionName, id);
-      await updateDoc(docRef, { status });
-
-      return { success: true };
-    } catch (error: any) {
-      console.error('Error updating quiz status:', error);
-      return { 
-        success: false, 
-        error: error.message || 'Failed to update quiz status' 
-      };
+  private extractErrorMessage(error: unknown): string {
+    if (error instanceof Error) {
+      return error.message || 'Unknown error occurred';
     }
-  }
-
-  async deleteQuiz(id: string): Promise<Result<void>> {
-    try {
-      const docRef = doc(db, this.collectionName, id);
-      await deleteDoc(docRef);
-
-      return { success: true };
-    } catch (error: any) {
-      console.error('Error deleting quiz:', error);
-      return { 
-        success: false, 
-        error: error.message || 'Failed to delete quiz' 
-      };
-    }
+    return 'Unknown error occurred';
   }
 }
 
-// Singleton instance
+// ============================================================================
+// Singleton Instance
+// ============================================================================
+
 let quizRepositoryInstance: FirestoreQuizRepository | null = null;
 
 export function getQuizRepository(): QuizRepository {

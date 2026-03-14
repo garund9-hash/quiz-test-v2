@@ -3,167 +3,230 @@
  * Prevents abuse and controls API costs by limiting request frequency
  */
 
-interface RateLimitRecord {
-  tokens: number;
-  lastRefill: number;
+// ============================================================================
+// Time Constants (milliseconds)
+// ============================================================================
+
+const ONE_SECOND = 1000;
+const ONE_MINUTE = 60 * ONE_SECOND;
+
+// ============================================================================
+// Type Definitions
+// ============================================================================
+
+interface RateLimitEntry {
+  availableTokens: number;
+  lastRefillTimestamp: number;
 }
 
-// In-memory storage for rate limits (per IP/user)
-const rateLimitStore = new Map<string, RateLimitRecord>();
-
-export interface RateLimitConfig {
-  maxTokens: number;      // Maximum tokens (burst capacity)
-  refillRate: number;     // Time in ms to refill one token
-  maxAge: number;         // Time in ms before record expires
+export interface RateLimitConfiguration {
+  /** Maximum tokens (burst capacity) */
+  maxTokens: number;
+  /** Milliseconds to refill one token */
+  millisecondsPerToken: number;
+  /** Milliseconds before entry expires */
+  entryMaxAge: number;
 }
 
-// Default configurations for different use cases
-export const RateLimitPresets = {
-  // Strict: 3 requests per minute
-  strict: { maxTokens: 3, refillRate: 20000, maxAge: 60000 } as RateLimitConfig,
+// ============================================================================
+// Preset Configurations
+// ============================================================================
+
+export const RATE_LIMIT_PRESETS: Record<string, RateLimitConfiguration> = {
+  /** Strict: 3 requests per minute */
+  strict: { 
+    maxTokens: 3, 
+    millisecondsPerToken: 20 * ONE_SECOND, 
+    entryMaxAge: ONE_MINUTE 
+  },
   
-  // Standard: 5 requests per minute  
-  standard: { maxTokens: 5, refillRate: 12000, maxAge: 120000 } as RateLimitConfig,
+  /** Standard: 5 requests per minute */
+  standard: { 
+    maxTokens: 5, 
+    millisecondsPerToken: 12 * ONE_SECOND, 
+    entryMaxAge: 2 * ONE_MINUTE 
+  },
   
-  // Lenient: 10 requests per minute
-  lenient: { maxTokens: 10, refillRate: 6000, maxAge: 300000 } as RateLimitConfig,
+  /** Lenient: 10 requests per minute */
+  lenient: { 
+    maxTokens: 10, 
+    millisecondsPerToken: 6 * ONE_SECOND, 
+    entryMaxAge: 5 * ONE_MINUTE 
+  },
   
-  // Quiz generation: 5 per hour (expensive AI operation)
-  quizGeneration: { maxTokens: 5, refillRate: 720000, maxAge: 3600000 } as RateLimitConfig,
+  /** Quiz generation: 5 per hour (expensive AI operation) */
+  quizGeneration: { 
+    maxTokens: 5, 
+    millisecondsPerToken: 12 * ONE_MINUTE, 
+    entryMaxAge: ONE_MINUTE 
+  },
   
-  // Quiz submission: 10 per minute
-  quizSubmission: { maxTokens: 10, refillRate: 6000, maxAge: 120000 } as RateLimitConfig
+  /** Quiz submission: 10 per minute */
+  quizSubmission: { 
+    maxTokens: 10, 
+    millisecondsPerToken: 6 * ONE_SECOND, 
+    entryMaxAge: 2 * ONE_MINUTE 
+  }
 };
 
-export class RateLimitError extends Error {
-  constructor(
-    message: string,
-    public readonly retryAfter: number
-  ) {
+// ============================================================================
+// Error Classes
+// ============================================================================
+
+export class RateLimitExceededError extends Error {
+  public readonly retryAfterSeconds: number;
+  
+  constructor(message: string, retryAfterSeconds: number) {
     super(message);
-    this.name = 'RateLimitError';
+    this.name = 'RateLimitExceededError';
+    this.retryAfterSeconds = retryAfterSeconds;
   }
 }
 
+// ============================================================================
+// Rate Limiter Class
+// ============================================================================
+
+/** In-memory storage for rate limit entries */
+const rateLimitStore = new Map<string, RateLimitEntry>();
+
 /**
- * Rate limiter using token bucket algorithm
+ * Token bucket rate limiter implementation
  */
 export class RateLimiter {
-  private config: RateLimitConfig;
+  private readonly config: RateLimitConfiguration;
 
-  constructor(config: RateLimitConfig = RateLimitPresets.standard) {
+  constructor(config: RateLimitConfiguration = RATE_LIMIT_PRESETS.standard) {
     this.config = config;
   }
 
   /**
    * Attempt to consume a token
-   * @param identifier - Unique identifier (IP, user ID, etc.)
+   * @param clientId - Unique identifier (IP, user ID, etc.)
    * @returns true if request is allowed, false if rate limited
    */
-  consume(identifier: string): boolean {
-    const now = Date.now();
-    const record = rateLimitStore.get(identifier);
+  tryConsume(clientId: string): boolean {
+    const currentTimestamp = Date.now();
+    const entry = rateLimitStore.get(clientId);
 
-    if (!record) {
-      // First request - initialize with max tokens minus one
-      rateLimitStore.set(identifier, {
-        tokens: this.config.maxTokens - 1,
-        lastRefill: now
-      });
+    if (!entry) {
+      this.initializeEntry(clientId, currentTimestamp);
       return true;
     }
 
-    // Refill tokens based on elapsed time
-    const elapsed = now - record.lastRefill;
-    const tokensToAdd = Math.floor(elapsed / this.config.refillRate);
-    
-    record.tokens = Math.min(
-      this.config.maxTokens,
-      record.tokens + tokensToAdd
-    );
-    record.lastRefill = now - (elapsed % this.config.refillRate);
+    this.refillTokens(entry, currentTimestamp);
+    this.cleanupStaleEntry(clientId, entry, currentTimestamp);
 
-    // Clean up old records
-    if (now - record.lastRefill > this.config.maxAge) {
-      rateLimitStore.delete(identifier);
-      return this.consume(identifier);
-    }
-
-    // Check if we have tokens available
-    if (record.tokens <= 0) {
+    if (entry.availableTokens <= 0) {
       return false;
     }
 
-    // Consume a token
-    record.tokens--;
+    entry.availableTokens--;
     return true;
   }
 
   /**
    * Check rate limit and throw error if exceeded
-   * @param identifier - Unique identifier
-   * @throws RateLimitError if rate limited
+   * @param clientId - Unique identifier
+   * @throws RateLimitExceededError if rate limited
    */
-  check(identifier: string): void {
-    if (!this.consume(identifier)) {
-      const record = rateLimitStore.get(identifier);
-      const retryAfter = record 
-        ? Math.ceil(this.config.refillRate / 1000)
-        : 60;
+  enforceLimit(clientId: string): void {
+    if (!this.tryConsume(clientId)) {
+      const entry = rateLimitStore.get(clientId);
+      const retryAfterSeconds = this.calculateRetryAfterSeconds(entry);
       
-      throw new RateLimitError(
-        `Rate limit exceeded. Try again in ${retryAfter} seconds.`,
-        retryAfter
+      throw new RateLimitExceededError(
+        `Rate limit exceeded. Try again in ${retryAfterSeconds} seconds.`,
+        retryAfterSeconds
       );
     }
   }
 
   /**
-   * Get remaining tokens for an identifier
+   * Get remaining tokens for a client
    */
-  getRemaining(identifier: string): number {
-    const record = rateLimitStore.get(identifier);
-    if (!record) return this.config.maxTokens;
+  getRemainingTokens(clientId: string): number {
+    const entry = rateLimitStore.get(clientId);
+    if (!entry) return this.config.maxTokens;
 
-    const now = Date.now();
-    const elapsed = now - record.lastRefill;
-    const tokensToAdd = Math.floor(elapsed / this.config.refillRate);
-    
-    return Math.min(
-      this.config.maxTokens,
-      record.tokens + tokensToAdd
-    );
+    const currentTimestamp = Date.now();
+    this.refillTokens(entry, currentTimestamp);
+    return entry.availableTokens;
   }
 
   /**
-   * Reset rate limit for an identifier
+   * Reset rate limit for a client
    */
-  reset(identifier: string): void {
-    rateLimitStore.delete(identifier);
+  reset(clientId: string): void {
+    rateLimitStore.delete(clientId);
   }
 
   /**
-   * Clear all rate limit records (useful for testing)
+   * Clear all rate limit entries (useful for testing)
    */
-  clear(): void {
+  clearAll(): void {
     rateLimitStore.clear();
   }
+
+  // ============================================================================
+  // Private Helper Methods
+  // ============================================================================
+
+  private initializeEntry(clientId: string, timestamp: number): void {
+    rateLimitStore.set(clientId, {
+      availableTokens: this.config.maxTokens - 1,
+      lastRefillTimestamp: timestamp
+    });
+  }
+
+  private refillTokens(entry: RateLimitEntry, currentTimestamp: number): void {
+    const elapsed = currentTimestamp - entry.lastRefillTimestamp;
+    const tokensToAdd = Math.floor(elapsed / this.config.millisecondsPerToken);
+    
+    entry.availableTokens = Math.min(
+      this.config.maxTokens,
+      entry.availableTokens + tokensToAdd
+    );
+    entry.lastRefillTimestamp = currentTimestamp - (elapsed % this.config.millisecondsPerToken);
+  }
+
+  private cleanupStaleEntry(
+    clientId: string, 
+    entry: RateLimitEntry, 
+    currentTimestamp: number
+  ): void {
+    if (currentTimestamp - entry.lastRefillTimestamp > this.config.entryMaxAge) {
+      rateLimitStore.delete(clientId);
+      this.initializeEntry(clientId, currentTimestamp);
+    }
+  }
+
+  private calculateRetryAfterSeconds(entry?: RateLimitEntry | null): number {
+    if (!entry) return 60;
+    return Math.ceil(this.config.millisecondsPerToken / ONE_SECOND);
+  }
+}
+
+// ============================================================================
+// Factory Functions
+// ============================================================================
+
+/**
+ * Create a rate limiter with a preset configuration
+ */
+export function createRateLimiter(
+  presetName: keyof typeof RATE_LIMIT_PRESETS = 'standard'
+): RateLimiter {
+  return new RateLimiter(RATE_LIMIT_PRESETS[presetName]);
 }
 
 /**
- * Create a rate limiter with the given preset
+ * Quick rate limit check (throws on failure)
  */
-export function createRateLimiter(preset: keyof typeof RateLimitPresets = 'standard'): RateLimiter {
-  return new RateLimiter(RateLimitPresets[preset]);
-}
-
-/**
- * Simple rate limit check function for quick use
- */
-export function checkRateLimit(
-  identifier: string, 
-  preset: keyof typeof RateLimitPresets = 'standard'
+export function enforceRateLimit(
+  clientId: string,
+  presetName: keyof typeof RATE_LIMIT_PRESETS = 'standard'
 ): void {
-  const limiter = createRateLimiter(preset);
-  limiter.check(identifier);
+  const limiter = createRateLimiter(presetName);
+  limiter.enforceLimit(clientId);
 }

@@ -1,89 +1,97 @@
 /**
  * Cache-Aside Pattern Implementation
- * Reduces database load and improves response times
+ * Reduces database load and improves response times with TTL-based caching
  */
+
+// ============================================================================
+// Time Constants (milliseconds)
+// ============================================================================
+
+const ONE_SECOND = 1000;
+const ONE_MINUTE = 60 * ONE_SECOND;
+const CLEANUP_INTERVAL = ONE_MINUTE;
+
+// ============================================================================
+// Type Definitions
+// ============================================================================
 
 interface CacheEntry<T> {
-  data: T;
-  timestamp: number;
-  ttl: number;
+  value: T;
+  createdAt: number;
+  timeToLive: number;
 }
 
-export interface CacheConfig {
-  defaultTTL: number;  // Time to live in milliseconds
-  maxSize: number;     // Maximum number of entries
+export interface CacheConfiguration {
+  /** Default TTL in milliseconds */
+  defaultTTL: number;
+  /** Maximum number of entries */
+  maxEntries: number;
 }
 
-const defaultConfig: CacheConfig = {
-  defaultTTL: 5 * 60 * 1000,  // 5 minutes
-  maxSize: 100                // 100 entries max
+// ============================================================================
+// Default Configuration
+// ============================================================================
+
+const DEFAULT_CONFIG: CacheConfiguration = {
+  defaultTTL: 5 * ONE_MINUTE,
+  maxEntries: 100
 };
 
+// ============================================================================
+// Cache Class
+// ============================================================================
+
 /**
- * In-memory cache with TTL support
+ * In-memory cache with TTL support and automatic cleanup
  */
-export class Cache<T = any> {
-  private store = new Map<string, CacheEntry<T>>();
-  private config: CacheConfig;
+export class Cache<T = unknown> {
+  private readonly store = new Map<string, CacheEntry<T>>();
+  private readonly config: CacheConfiguration;
 
-  constructor(config: Partial<CacheConfig> = {}) {
-    this.config = { ...defaultConfig, ...config };
-    
-    // Periodic cleanup of expired entries
-    this.startCleanupInterval();
-  }
-
-  private startCleanupInterval(): void {
-    setInterval(() => {
-      this.cleanup();
-    }, 60000); // Clean up every minute
+  constructor(config: Partial<CacheConfiguration> = {}) {
+    this.config = { ...DEFAULT_CONFIG, ...config };
+    this.startPeriodicCleanup();
   }
 
   /**
-   * Get value from cache
+   * Retrieve value from cache
    * @param key - Cache key
    * @returns Cached value or null if not found/expired
    */
   get(key: string): T | null {
     const entry = this.store.get(key);
-    
+
     if (!entry) {
       return null;
     }
 
-    // Check if entry has expired
-    if (Date.now() > entry.timestamp + entry.ttl) {
+    if (this.isExpired(entry)) {
       this.store.delete(key);
       return null;
     }
 
-    return entry.data;
+    return entry.value;
   }
 
   /**
-   * Set value in cache
+   * Store value in cache
    * @param key - Cache key
-   * @param data - Data to cache
+   * @param value - Value to cache
    * @param ttl - Optional custom TTL in milliseconds
    */
-  set(key: string, data: T, ttl?: number): void {
-    // Enforce max size by removing oldest entry
-    if (this.store.size >= this.config.maxSize) {
-      const oldestKey = this.store.keys().next().value;
-      if (oldestKey) {
-        this.store.delete(oldestKey);
-      }
-    }
+  set(key: string, value: T, ttl?: number): void {
+    this.enforceMaxSize();
 
     this.store.set(key, {
-      data,
-      timestamp: Date.now(),
-      ttl: ttl ?? this.config.defaultTTL
+      value,
+      createdAt: Date.now(),
+      timeToLive: ttl ?? this.config.defaultTTL
     });
   }
 
   /**
-   * Delete value from cache
+   * Remove value from cache
+   * @returns true if entry was removed
    */
   delete(key: string): boolean {
     return this.store.delete(key);
@@ -104,33 +112,56 @@ export class Cache<T = any> {
   }
 
   /**
-   * Remove expired entries
+   * Get cache statistics
    */
-  private cleanup(): void {
+  getStatistics(): { entryCount: number; keys: string[] } {
+    return {
+      entryCount: this.store.size,
+      keys: Array.from(this.store.keys())
+    };
+  }
+
+  // ============================================================================
+  // Private Methods
+  // ============================================================================
+
+  private isExpired(entry: CacheEntry<T>): boolean {
     const now = Date.now();
-    for (const [key, entry] of this.store.entries()) {
-      if (now > entry.timestamp + entry.ttl) {
-        this.store.delete(key);
+    return now > entry.createdAt + entry.timeToLive;
+  }
+
+  private enforceMaxSize(): void {
+    if (this.store.size >= this.config.maxEntries) {
+      const oldestKey = this.store.keys().next().value;
+      if (oldestKey) {
+        this.store.delete(oldestKey);
       }
     }
   }
 
-  /**
-   * Get cache statistics
-   */
-  getStats(): { size: number; keys: string[] } {
-    return {
-      size: this.store.size,
-      keys: Array.from(this.store.keys())
-    };
+  private startPeriodicCleanup(): void {
+    setInterval(() => this.cleanupExpiredEntries(), CLEANUP_INTERVAL);
+  }
+
+  private cleanupExpiredEntries(): void {
+    const now = Date.now();
+    for (const [key, entry] of this.store.entries()) {
+      if (now > entry.createdAt + entry.timeToLive) {
+        this.store.delete(key);
+      }
+    }
   }
 }
 
+// ============================================================================
+// Cache-Aside Wrapper
+// ============================================================================
+
 /**
- * Cache-Aside wrapper for async operations
+ * Implements cache-aside pattern for async operations
  */
 export class CacheAside {
-  private cache: Cache;
+  private readonly cache: Cache;
 
   constructor(cache?: Cache) {
     this.cache = cache ?? new Cache();
@@ -139,28 +170,28 @@ export class CacheAside {
   /**
    * Get from cache or fetch from source and cache the result
    * @param key - Cache key
-   * @param fetchFn - Function to fetch data if not in cache
-   * @param ttl - Optional custom TTL
+   * @param fetchOperation - Async function to fetch data on cache miss
+   * @param ttl - Optional custom TTL in milliseconds
    * @returns Cached or fetched data
    */
   async getOrFetch<T>(
     key: string,
-    fetchFn: () => Promise<T>,
+    fetchOperation: () => Promise<T>,
     ttl?: number
   ): Promise<T> {
     // Try cache first
-    const cached = this.cache.get(key) as T | null;
-    if (cached !== null) {
-      return cached;
+    const cachedValue = this.cache.get(key) as T | null;
+    if (cachedValue !== null) {
+      return cachedValue;
     }
 
     // Cache miss - fetch from source
-    const data = await fetchFn();
-    
+    const value = await fetchOperation();
+
     // Store in cache
-    this.cache.set(key, data as any, ttl);
-    
-    return data;
+    this.cache.set(key, value as T, ttl);
+
+    return value;
   }
 
   /**
@@ -178,37 +209,60 @@ export class CacheAside {
   }
 }
 
-// Singleton cache instances for different use cases
-const quizCache = new Cache({ defaultTTL: 5 * 60 * 1000, maxSize: 50 });
-const leaderboardCache = new Cache({ defaultTTL: 30 * 1000, maxSize: 100 });
+// ============================================================================
+// Pre-configured Cache Instances
+// ============================================================================
 
+/** Cache for quiz data (5 minute TTL, 50 entries max) */
+const quizCache = new Cache({ 
+  defaultTTL: 5 * ONE_MINUTE, 
+  maxEntries: 50 
+});
+
+/** Cache for leaderboard data (30 second TTL, 100 entries max) */
+const leaderboardCache = new Cache({ 
+  defaultTTL: 30 * ONE_SECOND, 
+  maxEntries: 100 
+});
+
+/** Quiz cache-aside instance */
 export const quizCacheAside = new CacheAside(quizCache);
+
+/** Leaderboard cache-aside instance */
 export const leaderboardCacheAside = new CacheAside(leaderboardCache);
 
+// ============================================================================
+// Cache Key Utilities
+// ============================================================================
+
 /**
- * Create a cache key for quiz PIN
+ * Generate cache key for quiz data
  */
-export function getQuizCacheKey(pin: string): string {
+export function buildQuizCacheKey(pin: string): string {
   return `quiz:${pin}`;
 }
 
 /**
- * Create a cache key for leaderboard
+ * Generate cache key for leaderboard data
  */
-export function getLeaderboardCacheKey(pin: string): string {
+export function buildLeaderboardCacheKey(pin: string): string {
   return `leaderboard:${pin}`;
 }
 
+// ============================================================================
+// Cache Invalidation Helpers
+// ============================================================================
+
 /**
- * Invalidate quiz cache when quiz is modified/deleted
+ * Invalidate quiz cache when quiz is modified or deleted
  */
 export function invalidateQuizCache(pin: string): void {
-  quizCacheAside.invalidate(getQuizCacheKey(pin));
+  quizCacheAside.invalidate(buildQuizCacheKey(pin));
 }
 
 /**
  * Invalidate leaderboard cache when new score is added
  */
 export function invalidateLeaderboardCache(pin: string): void {
-  leaderboardCacheAside.invalidate(getLeaderboardCacheKey(pin));
+  leaderboardCacheAside.invalidate(buildLeaderboardCacheKey(pin));
 }

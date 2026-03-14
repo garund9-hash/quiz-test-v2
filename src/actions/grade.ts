@@ -2,246 +2,372 @@
 
 import { getQuizRepository } from '@/lib/repositories/quiz-repository';
 import { getScoreRepository } from '@/lib/repositories/score-repository';
-import { validateJoinQuiz, validateSubmitQuiz } from '@/lib/validators';
-import { quizCacheAside, getQuizCacheKey, invalidateLeaderboardCache } from '@/lib/cache';
-import { firebaseCircuitBreaker, CircuitBreakerError } from '@/lib/circuit-breaker';
-import { createRateLimiter, RateLimitError } from '@/lib/rate-limiter';
+import { validateJoinQuiz, validateQuizSubmission } from '@/lib/validators';
+import { quizCacheAside, buildQuizCacheKey, invalidateLeaderboardCache } from '@/lib/cache';
+import { firebaseCircuitBreaker, CircuitOpenError } from '@/lib/circuit-breaker';
+import { createRateLimiter, RateLimitExceededError } from '@/lib/rate-limiter';
 import { isQuizExpired, getQuizLifecycleInfo } from '@/lib/ttl-manager';
 import { headers } from 'next/headers';
+import { Quiz, Question, OperationResult } from '@/lib/types';
+
+// ============================================================================
+// Constants
+// ============================================================================
+
+const CACHE_TTL_MS = 5 * 60 * 1000; // 5 minutes
+
+// ============================================================================
+// Types
+// ============================================================================
+
+interface QuizSessionData {
+  topic: string;
+  clientQuestions: Array<{ id: number; question: string; options: string[] }>;
+  lifecycleInfo: {
+    status: string;
+    createdAt: Date | null;
+    expiresAt: Date | null;
+    timeRemaining: { expired: boolean; milliseconds: number; hours: number; days: number };
+    formattedExpiry: string;
+  };
+}
+
+interface ScoreSubmissionResult {
+  score: number;
+  total: number;
+  scorePercentage: number;
+}
+
+// ============================================================================
+// Public Server Actions
+// ============================================================================
 
 /**
  * Get a quiz by PIN (client-safe version without answers)
- * Implements: validation, caching, circuit breaker
  */
-export async function getClientQuiz(pin: string) {
-  const ip = (await headers()).get('x-forwarded-for')?.split(',')[0] || 'unknown';
+export async function getClientQuiz(pin: string): Promise<OperationResult<QuizSessionData>> {
+  const clientIp = await getClientIp();
 
   try {
-    // 1. Validate PIN format
-    const validation = validateJoinQuiz({ pin, nickname: 'temp' });
-    if (!validation.success) {
-      // Find the pin-specific error
-      const pinError = validation.error.issues.find((e: any) => e.path[0] === 'pin');
-      if (pinError) {
-        return { success: false, error: pinError.message };
-      }
+    // Step 1: Validate PIN format
+    const pinValidation = validatePinFormat(pin);
+    if (!pinValidation.success) {
+      return { success: false, error: pinValidation.error };
     }
 
-    // 2. Check rate limit
-    const rateLimiter = createRateLimiter('standard');
-    try {
-      rateLimiter.check(ip);
-    } catch (error) {
-      if (error instanceof RateLimitError) {
-        return { success: false, error: error.message };
-      }
-      throw error;
+    // Step 2: Check rate limit
+    const rateLimitResult = checkStandardRateLimit(clientIp);
+    if (!rateLimitResult.success) {
+      return { success: false, error: rateLimitResult.error };
     }
 
-    // 3. Try cache first (Cache-Aside pattern)
-    const cacheKey = getQuizCacheKey(pin);
-    const cachedQuiz = await quizCacheAside.getOrFetch(
-      cacheKey,
-      async () => {
-        // Cache miss - fetch from database via repository
-        const quizRepo = getQuizRepository();
-        
-        return await firebaseCircuitBreaker.execute(async () => {
-          const result = await quizRepo.findActiveByPin(pin);
-          
-          if (!result.success) {
-            throw new Error(result.error);
-          }
-          
-          return result.data;
-        });
-      },
-      5 * 60 * 1000 // 5 minute TTL
-    );
-
-    if (!cachedQuiz) {
-      return { success: false, error: 'Quiz not found or not active' };
+    // Step 3: Fetch quiz (with caching)
+    const quizResult = await fetchQuizWithCache(pin);
+    if (!quizResult.success || !quizResult.data) {
+      return { success: false, error: quizResult.error || 'Quiz not found' };
     }
 
-    // 4. Check if quiz is expired
-    const lifecycleInfo = getQuizLifecycleInfo(
-      cachedQuiz.createdAt,
-      cachedQuiz.expiresAt
-    );
+    const quiz = quizResult.data;
 
-    if (lifecycleInfo.status === 'expired') {
-      // Remove from cache
-      quizCacheAside.invalidate(cacheKey);
+    // Step 4: Check expiration
+    if (isQuizExpired(quiz.expiresAt)) {
+      invalidateQuizCache(pin);
       return { success: false, error: 'This quiz has expired' };
     }
 
-    // 5. Return client-safe data
+    // Step 5: Return client-safe data
     return {
       success: true,
-      topic: cachedQuiz.topic,
-      clientQuestions: cachedQuiz.clientQuestions,
-      lifecycleInfo
+      data: {
+        topic: quiz.topic,
+        clientQuestions: quiz.clientQuestions,
+        lifecycleInfo: getQuizLifecycleInfo(
+          quiz.createdAt,
+          quiz.expiresAt
+        )
+      }
     };
 
-  } catch (error: any) {
-    console.error('[Grade Action] Error getting quiz:', error);
-    
-    if (error instanceof CircuitBreakerError) {
-      return { 
-        success: false, 
-        error: 'Service temporarily unavailable. Please try again.' 
-      };
-    }
-    
-    return { 
-      success: false, 
-      error: error.message || 'An unexpected error occurred' 
-    };
+  } catch (error: unknown) {
+    return handleServiceError(error);
   }
 }
 
 /**
  * Submit quiz answers and get score
- * Implements: validation, rate limiting, server-side grading
  */
 export async function submitQuizAnswers(
   pin: string,
   nickname: string,
   answers: number[]
-) {
-  const ip = (await headers()).get('x-forwarded-for')?.split(',')[0] || 'unknown';
+): Promise<OperationResult<ScoreSubmissionResult>> {
+  const clientIp = await getClientIp();
 
   try {
-    // 1. Validate all inputs
-    const validation = validateSubmitQuiz({ pin, nickname, answers });
-    if (!validation.success) {
-      const firstError = validation.error.issues[0];
-      return {
-        success: false,
-        error: `${firstError.path.join('.')}: ${firstError.message}`
-      };
+    // Step 1: Validate all inputs
+    const inputValidation = validateQuizInput(pin, nickname, answers);
+    if (!inputValidation.success || !inputValidation.data) {
+      return { success: false, error: inputValidation.error || 'Invalid input' };
     }
 
-    const { pin: validatedPin, nickname: validatedNickname, answers: validatedAnswers } = validation.data;
+    const { pin: validatedPin, nickname: validatedNickname, answers: validatedAnswers } = inputValidation.data;
 
-    // 2. Check rate limit (more lenient for submissions)
-    const rateLimiter = createRateLimiter('quizSubmission');
-    try {
-      rateLimiter.check(ip);
-    } catch (error) {
-      if (error instanceof RateLimitError) {
-        return { success: false, error: error.message };
-      }
-      throw error;
+    // Step 2: Check rate limit
+    const rateLimitResult = checkSubmissionRateLimit(clientIp);
+    if (!rateLimitResult.success) {
+      return { success: false, error: rateLimitResult.error };
     }
 
-    // 3. Fetch quiz from database (with circuit breaker protection)
-    const quizRepo = getQuizRepository();
-    const quizResult = await firebaseCircuitBreaker.execute(async () => {
-      return await quizRepo.findByPin(validatedPin);
-    });
-
+    // Step 3: Fetch quiz from database
+    const quizResult = await fetchQuiz(validatedPin);
     if (!quizResult.success || !quizResult.data) {
-      return { success: false, error: 'Quiz not found' };
+      return { success: false, error: quizResult.error || 'Quiz not found' };
     }
 
     const quiz = quizResult.data;
 
-    // 4. Check if quiz is expired
+    // Step 4: Check expiration
     if (isQuizExpired(quiz.expiresAt)) {
       return { success: false, error: 'This quiz has expired' };
     }
 
-    // 5. Server-side grading (answers never sent to client)
-    let score = 0;
-    const total = quiz.questions.length;
+    // Step 5: Grade quiz (server-side)
+    const score = calculateScore(validatedAnswers, quiz.questions);
 
-    validatedAnswers.forEach((ans, index) => {
-      // Allow for 0 score if unanswered (ans === -1)
-      if (ans !== -1 && index < total) {
-        const correctAnswer = quiz.questions[index].correctAnswer;
-        if (Number(correctAnswer) === Number(ans)) {
-          score += 1;
-        }
-      }
-    });
-
-    const scorePercentage = Math.round((score / total) * 100);
-
-    // 6. Save score to leaderboard via repository
-    const scoreRepo = getScoreRepository();
-    const saveResult = await scoreRepo.createScore({
+    // Step 6: Save score to leaderboard
+    const saveResult = await saveScore({
       quizId: quiz.id!,
       pin: validatedPin,
       nickname: validatedNickname,
       score,
-      total,
-      scorePercentage,
-      submittedAt: new Date()
+      total: quiz.questions.length
     });
 
     if (!saveResult.success) {
       return { success: false, error: saveResult.error };
     }
 
-    // 7. Invalidate leaderboard cache to force refresh
+    // Step 7: Invalidate leaderboard cache
     invalidateLeaderboardCache(validatedPin);
 
     return {
       success: true,
-      score,
-      total,
-      scorePercentage
+      data: {
+        score,
+        total: quiz.questions.length,
+        scorePercentage: Math.round((score / quiz.questions.length) * 100)
+      }
     };
 
-  } catch (error: any) {
-    console.error('[Grade Action] Error submitting quiz:', error);
-    
-    if (error instanceof CircuitBreakerError) {
-      return { 
-        success: false, 
-        error: 'Service temporarily unavailable. Please try again.' 
-      };
-    }
-    
-    return { 
-      success: false, 
-      error: error.message || 'An unexpected error occurred' 
-    };
+  } catch (error: unknown) {
+    return handleServiceError(error);
   }
 }
 
 /**
  * Get leaderboard entries for a quiz PIN
- * Used by the client-side real-time subscription
  */
 export async function getLeaderboard(pin: string) {
   try {
-    const validation = validateJoinQuiz({ pin, nickname: 'temp' });
-    if (!validation.success) {
-      const pinError = validation.error.issues.find((e: any) => e.path[0] === 'pin');
-      if (pinError) {
-        return { success: false, error: pinError.message };
-      }
+    const pinValidation = validatePinFormat(pin);
+    if (!pinValidation.success) {
+      return { success: false, error: pinValidation.error };
     }
 
-    const scoreRepo = getScoreRepository();
-    const result = await scoreRepo.findByPin(pin);
+    const scoreRepository = getScoreRepository();
+    const result = await scoreRepository.findByPin(pin);
 
     if (!result.success) {
       return { success: false, error: result.error };
     }
 
-    return {
-      success: true,
-      data: result.data
-    };
+    return { success: true, data: result.data };
 
-  } catch (error: any) {
-    console.error('[Grade Action] Error getting leaderboard:', error);
+  } catch (error: unknown) {
+    const errorMessage = error instanceof Error ? error.message : 'Failed to fetch leaderboard';
+    console.error('[Leaderboard] Error:', errorMessage);
+    return { success: false, error: errorMessage };
+  }
+}
+
+// ============================================================================
+// Private Helper Functions - Validation
+// ============================================================================
+
+function validatePinFormat(pin: string): OperationResult<never> {
+  const validation = validateJoinQuiz({ pin, nickname: 'temp' });
+  
+  if (!validation.success) {
+    const pinError = validation.error.issues.find((issue) => 
+      String(issue.path[0]) === 'pin'
+    );
+    if (pinError) {
+      return { success: false, error: pinError.message };
+    }
+  }
+  
+  return { success: true, data: undefined as never };
+}
+
+function validateQuizInput(
+  pin: string,
+  nickname: string,
+  answers: number[]
+): OperationResult<{ pin: string; nickname: string; answers: number[] }> {
+  const validation = validateQuizSubmission({ pin, nickname, answers });
+  
+  if (!validation.success) {
+    const firstError = validation.error.issues[0];
     return { 
-      success: false, 
-      error: error.message || 'Failed to fetch leaderboard' 
+      success: false,
+      error: `${firstError.path.join('.')}: ${firstError.message}`
     };
   }
+
+  return { success: true, data: validation.data };
+}
+
+// ============================================================================
+// Private Helper Functions - Rate Limiting
+// ============================================================================
+
+function checkStandardRateLimit(clientIp: string): OperationResult<never> {
+  const rateLimiter = createRateLimiter('standard');
+  
+  try {
+    rateLimiter.enforceLimit(clientIp);
+    return { success: true, data: undefined as never };
+  } catch (error) {
+    if (error instanceof RateLimitExceededError) {
+      return { success: false, error: error.message };
+    }
+    throw error;
+  }
+}
+
+function checkSubmissionRateLimit(clientIp: string): OperationResult<never> {
+  const rateLimiter = createRateLimiter('quizSubmission');
+  
+  try {
+    rateLimiter.enforceLimit(clientIp);
+    return { success: true, data: undefined as never };
+  } catch (error) {
+    if (error instanceof RateLimitExceededError) {
+      return { success: false, error: error.message };
+    }
+    throw error;
+  }
+}
+
+// ============================================================================
+// Private Helper Functions - Data Access
+// ============================================================================
+
+async function fetchQuizWithCache(pin: string): Promise<OperationResult<Quiz>> {
+  const cacheKey = buildQuizCacheKey(pin);
+
+  try {
+    const quiz = await quizCacheAside.getOrFetch(
+      cacheKey,
+      async () => await fetchQuizFromDatabase(pin),
+      CACHE_TTL_MS
+    );
+
+    return { success: true, data: quiz };
+  } catch (error) {
+    if (error instanceof CircuitOpenError) {
+      return { success: false, error: 'Service temporarily unavailable. Please try again.' };
+    }
+    if (error instanceof Error) {
+      return { success: false, error: error.message };
+    }
+    return { success: false, error: 'Failed to fetch quiz' };
+  }
+}
+
+async function fetchQuiz(pin: string): Promise<OperationResult<Quiz>> {
+  try {
+    return await firebaseCircuitBreaker.execute(async () => {
+      const quizRepository = getQuizRepository();
+      return await quizRepository.findByPin(pin);
+    });
+  } catch (error) {
+    if (error instanceof CircuitOpenError) {
+      return { success: false, error: 'Service temporarily unavailable. Please try again.' };
+    }
+    throw error;
+  }
+}
+
+async function fetchQuizFromDatabase(pin: string): Promise<Quiz> {
+  const quizRepository = getQuizRepository();
+  const result = await quizRepository.findActiveByPin(pin);
+
+  if (!result.success) {
+    throw new Error(result.error);
+  }
+
+  return result.data!;
+}
+
+// ============================================================================
+// Private Helper Functions - Grading
+// ============================================================================
+
+function calculateScore(answers: number[], questions: Question[]): number {
+  let score = 0;
+
+  answers.forEach((answer, index) => {
+    if (answer !== -1 && index < questions.length) {
+      const correctAnswer = questions[index].correctAnswer;
+      if (Number(correctAnswer) === Number(answer)) {
+        score += 1;
+      }
+    }
+  });
+
+  return score;
+}
+
+async function saveScore(scoreData: {
+  quizId: string;
+  pin: string;
+  nickname: string;
+  score: number;
+  total: number;
+}): Promise<OperationResult<string>> {
+  const scoreRepository = getScoreRepository();
+  
+  return await scoreRepository.createScore({
+    quizId: scoreData.quizId,
+    pin: scoreData.pin,
+    nickname: scoreData.nickname,
+    score: scoreData.score,
+    total: scoreData.total,
+    scorePercentage: Math.round((scoreData.score / scoreData.total) * 100),
+    submittedAt: new Date()
+  });
+}
+
+// ============================================================================
+// Private Helper Functions - Utilities
+// ============================================================================
+
+async function getClientIp(): Promise<string> {
+  const headersList = await headers();
+  return headersList.get('x-forwarded-for')?.split(',')[0] || 'unknown';
+}
+
+function handleServiceError(error: unknown): OperationResult<never> {
+  if (error instanceof CircuitOpenError) {
+    return { success: false, error: 'Service temporarily unavailable. Please try again.' };
+  }
+
+  const errorMessage = error instanceof Error ? error.message : 'An unexpected error occurred';
+  console.error('[Grade Action] Error:', errorMessage);
+  return { success: false, error: errorMessage };
+}
+
+function invalidateQuizCache(pin: string): void {
+  quizCacheAside.invalidate(buildQuizCacheKey(pin));
 }

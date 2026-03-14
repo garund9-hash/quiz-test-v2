@@ -20,9 +20,9 @@ export default function QuizPage({ params }: { params: Promise<{ pin: string }> 
   useEffect(() => {
     async function loadQuiz() {
       const res = await getClientQuiz(pin);
-      if (res.success && res.clientQuestions) {
-        setQuizData(res);
-        setAnswers(new Array(res.clientQuestions.length).fill(-1));
+      if (res.success && res.data) {
+        setQuizData(res.data);
+        setAnswers(new Array(res.data.clientQuestions.length).fill(-1));
       } else {
         setError(res.error || 'Quiz not found');
       }
