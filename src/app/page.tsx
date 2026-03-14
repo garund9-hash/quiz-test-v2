@@ -18,56 +18,177 @@ export default function Home() {
   };
 
   return (
-    <div className="container flex-col items-center flex-center animate-fade" style={{ minHeight: '100vh', padding: '4rem 2rem' }}>
-      <div className="text-center mb-16">
-        <h1 className="text-gradient mb-6" style={{ fontSize: '4.5rem', lineHeight: '1.1' }}>
-          Educational AI Quiz
+    <div className="container flex-col items-center flex-center" style={{ minHeight: '100vh', padding: '5rem 2rem 3rem' }}>
+      {/* Hero Section */}
+      <div className="text-center mb-16 animate-slide-up" style={{ maxWidth: '800px' }}>
+        <div className="badge badge-primary mb-6 animate-float" style={{ display: 'inline-flex' }}>
+          <span style={{ width: '6px', height: '6px', background: 'var(--primary)', borderRadius: '50%' }}></span>
+          Powered by Gemini AI
+        </div>
+        
+        <h1 className="text-6xl mb-6 text-gradient" style={{ marginBottom: '1.5rem' }}>
+          Illuminate Your<br />
+          <span style={{ fontStyle: 'italic', fontWeight: 400 }}>Knowledge</span>
         </h1>
-        <p className="text-xl" style={{ color: '#94a3b8', maxWidth: '600px', margin: '0 auto', lineHeight: '1.6' }}>
-          The premium educational quiz platform powered by Gemini AI and Firebase. 
-          Generate insightful quizzes in seconds, learn together, and compete on the live leaderboard.
+        
+        <p className="text-lg" style={{ color: 'var(--foreground-muted)', maxWidth: '580px', margin: '0 auto', lineHeight: '1.8' }}>
+          Create intelligent quizzes in seconds with AI. Join live sessions, 
+          challenge your understanding, and climb the leaderboard.
         </p>
       </div>
 
-      <div className="flex-center gap-8" style={{ display: 'flex', flexWrap: 'wrap', justifyContent: 'center' }}>
-        <div className="card text-center" style={{ width: '320px', display: 'flex', flexDirection: 'column' }}>
-          <div className="text-6xl mb-6">👩‍🏫</div>
-          <h2 className="text-2xl mb-4 text-gradient">For Professors</h2>
-          <p className="text-sm mb-8 flex-1" style={{ color: '#cbd5e1' }}>
-            Instantly generate 4-choice AI quizzes on any topic. Get a quick 4-digit PIN to share with your students.
-          </p>
-          <Link href="/professor" className="btn btn-primary w-full">
-            Create a Quiz
+      {/* Main Cards */}
+      <div className="flex-center gap-12 mb-16" style={{ display: 'flex', flexWrap: 'wrap', justifyContent: 'center', width: '100%' }}>
+        {/* Professor Card */}
+        <div className="glass-card animate-slide-up animate-delay-1" style={{ 
+          width: '360px', 
+          display: 'flex', 
+          flexDirection: 'column',
+          position: 'relative',
+          overflow: 'hidden'
+        }}>
+          {/* Decorative glow */}
+          <div style={{
+            position: 'absolute',
+            top: '-100px',
+            right: '-100px',
+            width: '200px',
+            height: '200px',
+            background: 'radial-gradient(circle, var(--primary-glow) 0%, transparent 70%)',
+            opacity: 0.5,
+            pointerEvents: 'none'
+          }}></div>
+          
+          <div className="text-center mb-8">
+            <div className="text-6xl mb-6 animate-float">👩‍🏫</div>
+            <h2 className="text-3xl mb-3 text-gradient-gold">For Educators</h2>
+            <p className="text-sm" style={{ color: 'var(--foreground-muted)' }}>
+              Transform any topic into an engaging 4-choice quiz instantly. 
+              Share a simple PIN and watch your students learn.
+            </p>
+          </div>
+          
+          <Link href="/professor" className="btn btn-primary btn-full" style={{ marginTop: 'auto' }}>
+            <span>Create Quiz</span>
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+              <path d="M5 12h14M12 5l7 7-7 7"/>
+            </svg>
           </Link>
         </div>
 
-        <div className="card text-center" style={{ width: '320px', display: 'flex', flexDirection: 'column' }}>
-          <div className="text-6xl mb-6">👨‍🎓</div>
-          <h2 className="text-2xl mb-4 text-gradient">For Learners</h2>
-          <p className="text-sm mb-8 flex-1" style={{ color: '#cbd5e1' }}>
-            Join a live session using your professor's PIN. Take the quiz and compete on the real-time leaderboard!
-          </p>
+        {/* Learner Card */}
+        <div className="glass-card animate-slide-up animate-delay-2" style={{ 
+          width: '360px', 
+          display: 'flex', 
+          flexDirection: 'column',
+          position: 'relative',
+          overflow: 'hidden'
+        }}>
+          {/* Decorative glow */}
+          <div style={{
+            position: 'absolute',
+            top: '-100px',
+            left: '-100px',
+            width: '200px',
+            height: '200px',
+            background: 'radial-gradient(circle, var(--accent-glow) 0%, transparent 70%)',
+            opacity: 0.5,
+            pointerEvents: 'none'
+          }}></div>
           
-          <form className="flex-col gap-4" onSubmit={handleJoin}>
-            <input 
-              type="text" 
-              className="input-field text-center text-xl font-bold" 
-              placeholder="1234" 
-              maxLength={4}
-              value={pin}
-              onChange={(e) => setPin(e.target.value.replace(/[^0-9]/g, ''))}
-              required
-              style={{ letterSpacing: '4px' }}
-            />
-            <button type="submit" className="btn btn-primary w-full">
-              Join Quiz
+          <div className="text-center mb-8">
+            <div className="text-6xl mb-6 animate-float" style={{ animationDelay: '0.5s' }}>👨‍🎓</div>
+            <h2 className="text-3xl mb-3 text-gradient-rose">For Learners</h2>
+            <p className="text-sm" style={{ color: 'var(--foreground-muted)' }}>
+              Enter a PIN, test your knowledge, and compete in real-time. 
+              See how you rank against others instantly.
+            </p>
+          </div>
+
+          <form onSubmit={handleJoin} className="flex-col gap-4" style={{ marginTop: 'auto' }}>
+            <div style={{ position: 'relative' }}>
+              <input
+                type="text"
+                className="input-field text-center text-2xl font-bold"
+                placeholder="Enter PIN"
+                maxLength={4}
+                value={pin}
+                onChange={(e) => setPin(e.target.value.replace(/[^0-9]/g, ''))}
+                required
+                style={{ 
+                  letterSpacing: '8px',
+                  background: 'rgba(15, 20, 35, 0.8)',
+                  fontWeight: 700
+                }}
+              />
+              {/* PIN input glow effect */}
+              <div style={{
+                position: 'absolute',
+                bottom: '-2px',
+                left: '50%',
+                transform: 'translateX(-50%)',
+                width: '60%',
+                height: '2px',
+                background: pin.length === 4 ? 'var(--primary)' : 'transparent',
+                boxShadow: pin.length === 4 ? '0 0 20px var(--primary)' : 'none',
+                transition: 'all 0.3s ease'
+              }}></div>
+            </div>
+            
+            <button 
+              type="submit" 
+              className="btn btn-accent btn-full"
+              disabled={pin.length !== 4}
+              style={{ opacity: pin.length !== 4 ? 0.5 : 1 }}
+            >
+              <span>Join Quiz</span>
+              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+                <path d="M5 12h14M12 5l7 7-7 7"/>
+              </svg>
             </button>
           </form>
         </div>
       </div>
-      
-      <div className="mt-20 text-sm text-center" style={{ color: '#64748b' }}>
-        Built with Next.js, Firebase, and Gemini AI. Premium custom design.
+
+      {/* Features Section */}
+      <div className="animate-slide-up animate-delay-3" style={{ maxWidth: '900px', width: '100%' }}>
+        <div className="divider"></div>
+        
+        <div style={{ 
+          display: 'grid', 
+          gridTemplateColumns: 'repeat(auto-fit, minmax(250px, 1fr))', 
+          gap: '2rem',
+          marginTop: '2rem'
+        }}>
+          <div className="flex-col items-center text-center">
+            <div className="text-3xl mb-4">✨</div>
+            <h3 className="text-lg font-semibold mb-2" style={{ color: 'var(--foreground)' }}>AI-Powered</h3>
+            <p className="text-sm" style={{ color: 'var(--foreground-muted)' }}>
+              Gemini 2.5 Flash generates accurate, insightful questions on any topic
+            </p>
+          </div>
+          
+          <div className="flex-col items-center text-center">
+            <div className="text-3xl mb-4">⚡</div>
+            <h3 className="text-lg font-semibold mb-2" style={{ color: 'var(--foreground)' }}>Real-Time</h3>
+            <p className="text-sm" style={{ color: 'var(--foreground-muted)' }}>
+              Live leaderboard updates as students complete quizzes instantly
+            </p>
+          </div>
+          
+          <div className="flex-col items-center text-center">
+            <div className="text-3xl mb-4">🔒</div>
+            <h3 className="text-lg font-semibold mb-2" style={{ color: 'var(--foreground)' }}>Secure</h3>
+            <p className="text-sm" style={{ color: 'var(--foreground-muted)' }}>
+              Server-side grading ensures answers never leak to clients
+            </p>
+          </div>
+        </div>
+      </div>
+
+      {/* Footer */}
+      <div className="mt-12 text-sm text-center animate-fade" style={{ color: 'var(--foreground-muted)', opacity: 0.6 }}>
+        <p>Built with Next.js, Firebase & Gemini AI</p>
       </div>
     </div>
   );
